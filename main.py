@@ -52,11 +52,12 @@ class GameState:
     recent_turns: list[tuple[str, str]] = field(default_factory=list)
     current_player_action: str = ""
     game_started: bool = False
-    emergency_clue_requests: int = 0
-    emergency_clue_mysteries: set[str] = field(default_factory=set)
     emergency_clue_request_active: bool = False
     emergency_clue_added_this_request: bool = False
     emergency_clue_target_mysteries: set[str] = field(default_factory=set)
+    character_knowledge_request_active: bool = False
+    character_knowledge_added_this_request: bool = False
+    character_knowledge_request_target: tuple[str, str, str, str] | None = None
 
     def stage_clue(self, clue_id: str, action_sufficient: bool, action_justification: str) -> str:
         assert self.case_file is not None
@@ -94,21 +95,24 @@ class GameState:
                 return json.dumps(
                     {
                         "resolved": False,
+                        "failure_reason": "The murder cannot be resolved until its existing prerequisite mystery or mysteries are resolved.",
                         "unresolved_prerequisite_mysteries": missing_mysteries,
                     },
                     ensure_ascii=False,
                 )
 
             if not resolution_sufficient:
-                return (
-                    "The player's current argument and known information are not yet sufficient to resolve this mystery. "
-                    "No answer was returned. Use the case's resolution requirement to decide what is missing: "
-                    + str(mystery.get("resolution_requirement", "a relevant question, clue, or reasoned explanation"))
+                return json.dumps(
+                    {
+                        "resolved": False,
+                        "failure_reason": reasoning.strip() or "The player's argument does not yet meet the resolution standard.",
+                        "resolution_requirement": str(mystery.get("resolution_requirement", "a relevant question, clue, or reasoned explanation")),
+                        "answer_withheld": True,
+                    },
+                    ensure_ascii=False,
                 )
 
-            answer = str(mystery.get("answer", ""))
-            if not answer:
-                return "This mystery has no recorded answer. Do not invent one; consult the Case Designer."
+            answer = str(mystery["answer"])
             self.staged_mysteries[stored_id] = answer
             return json.dumps({"resolved": True, "mystery_id": stored_id, "answer": answer}, ensure_ascii=False)
         return "No mystery with that ID exists."
@@ -223,6 +227,8 @@ def validate_case_file(raw: str) -> dict[str, Any]:
             raise ValueError(f"Character {character['name']} needs importance 'major' or 'minor'.")
         if character.get("importance") == "major" and not character.get("investigative_hook"):
             raise ValueError(f"Major character {character['name']} needs an investigative_hook.")
+        if character.get("importance") == "major" and not str(character.get("theory_or_lead", "")).strip():
+            raise ValueError(f"Major character {character['name']} needs a public theory_or_lead.")
         guarded = character.get("guarded_information", [])
         if not isinstance(guarded, list):
             raise ValueError(f"Character {character['name']} needs guarded_information as an array.")
@@ -281,6 +287,45 @@ def validate_case_file(raw: str) -> dict[str, Any]:
             raise ValueError(f"{label} repeats an ID in {key}.")
         return folded_refs
 
+    for character in case["characters"]:
+        for field_name in ("clues_knowledge", "mystery_knowledge"):
+            if not isinstance(character.get(field_name), list):
+                raise ValueError(f"Character {character['name']} needs {field_name} as an array.")
+        if character.get("importance") == "major" and not (
+            character["clues_knowledge"] or character["mystery_knowledge"]
+        ):
+            raise ValueError(f"Major character {character['name']} needs at least one clue or mystery knowledge lead.")
+        for field_name, linked_fields in (
+            ("clues_knowledge", ("clue_id", "mystery_id")),
+            ("mystery_knowledge", ("mystery_id", "clue_id")),
+        ):
+            entries = character.get(field_name, [])
+            if not isinstance(entries, list):
+                raise ValueError(f"Character {character['name']} needs {field_name} as an array.")
+            seen_links: set[tuple[str, str]] = set()
+            for entry in entries:
+                if not isinstance(entry, dict) or not all(
+                    isinstance(entry.get(key), str) and entry[key].strip()
+                    for key in (*linked_fields, "description")
+                ):
+                    raise ValueError(
+                        f"Character {character['name']} has invalid {field_name}; each entry needs "
+                        f"{', '.join((*linked_fields, 'description'))}."
+                    )
+                mystery_id = entry["mystery_id"].casefold()
+                clue_id = entry["clue_id"].casefold()
+                if mystery_id not in mystery_ids:
+                    raise ValueError(f"Character {character['name']} has {field_name} linked to an unknown mystery.")
+                if clue_id not in {str(clue['id']).casefold() for clue in case['clues']}:
+                    raise ValueError(f"Character {character['name']} has {field_name} linked to an unknown clue.")
+                linked_clue = next(clue for clue in case["clues"] if str(clue["id"]).casefold() == clue_id)
+                if mystery_id not in {str(value).casefold() for value in linked_clue.get("mystery_ids", [])}:
+                    raise ValueError(f"Character {character['name']} has {field_name} linked to a clue that does not inform that mystery.")
+                link = (mystery_id, clue_id)
+                if link in seen_links:
+                    raise ValueError(f"Character {character['name']} repeats a mystery/clue link in {field_name}.")
+                seen_links.add(link)
+
     for mystery in case["mysteries"]:
         if mystery.get("type") not in {"murder", "submystery"}:
             raise ValueError(f"Mystery {mystery['id']} needs type 'murder' or 'submystery'.")
@@ -336,30 +381,6 @@ def validate_case_file(raw: str) -> dict[str, Any]:
             if character["name"].casefold() not in involved:
                 raise ValueError(f"Wrong suspect {character['name']}'s exoneration mystery must involve them.")
 
-    # A circular dependency among clues and mysteries would make the case impossible to solve.
-    dependencies: dict[str, list[str]] = {}
-    for clue in case["clues"]:
-        node = f"clue:{str(clue['id']).casefold()}"
-        dependencies[node] = []
-    for mystery in case["mysteries"]:
-        node = f"mystery:{str(mystery['id']).casefold()}"
-        dependencies[node] = [f"mystery:{str(ref).casefold()}" for ref in mystery.get("required_mystery_ids", [])]
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(node: str) -> None:
-        if node in visiting:
-            raise ValueError("Clue and mystery prerequisites contain a circular dependency.")
-        if node in visited:
-            return
-        visiting.add(node)
-        for prerequisite in dependencies.get(node, []):
-            visit(prerequisite)
-        visiting.remove(node)
-        visited.add(node)
-
-    for dependency_node in dependencies:
-        visit(dependency_node)
     return case
 
 
@@ -416,6 +437,54 @@ def create_designer_tools(state: GameState) -> list[Any]:
         return "Addition recorded without changing the canonical case. It will count as player knowledge after this turn is delivered."
 
     @function_tool
+    def add_character_knowledge(
+        character_name: str,
+        knowledge_type: str,
+        clue_id: str,
+        mystery_id: str,
+        description: str,
+        why_it_fits: str,
+    ) -> str:
+        """Append one Case Designer-approved, spoiler-safe character lead during a narrator hint request."""
+        if not state.character_knowledge_request_active or state.case_file is None:
+            return "Character knowledge can be added only during an active narrator hint request."
+        if state.character_knowledge_added_this_request:
+            return "Only one character knowledge entry may be added per hint request."
+        if knowledge_type not in {"clue", "mystery"}:
+            return "knowledge_type must be 'clue' or 'mystery'."
+        if not description.strip() or not why_it_fits.strip():
+            return "Provide both a non-empty description and why it fits the established case."
+        expected = state.character_knowledge_request_target
+        supplied = (character_name.casefold(), knowledge_type, clue_id.casefold(), mystery_id.casefold())
+        if supplied != expected:
+            return "Addition rejected: it must match the character and clue/mystery link requested by the Narrator."
+        character = next(
+            (item for item in state.case_file["characters"] if str(item["name"]).casefold() == character_name.casefold()),
+            None,
+        )
+        clue = next((item for item in state.case_file["clues"] if str(item["id"]).casefold() == clue_id.casefold()), None)
+        mystery = next((item for item in state.case_file["mysteries"] if str(item["id"]).casefold() == mystery_id.casefold()), None)
+        if character is None or clue is None or mystery is None:
+            return "Addition rejected: the character, clue, and mystery must already exist in the case."
+        if mystery_id.casefold() not in {str(value).casefold() for value in clue.get("mystery_ids", [])}:
+            return "Addition rejected: that clue does not inform the linked mystery."
+        field_name = "clues_knowledge" if knowledge_type == "clue" else "mystery_knowledge"
+        if any(
+            str(entry.get("clue_id", "")).casefold() == clue_id.casefold()
+            and str(entry.get("mystery_id", "")).casefold() == mystery_id.casefold()
+            for entry in character.get(field_name, [])
+        ):
+            return "Addition rejected: this character already has knowledge linked to that clue and mystery."
+        character.setdefault(field_name, []).append(
+            {"clue_id": clue["id"], "mystery_id": mystery["id"], "description": description.strip()}
+        )
+        state.character_knowledge_added_this_request = True
+        return json.dumps(
+            {"character": character["name"], "knowledge_type": knowledge_type, "description": description.strip(), "why_it_fits": why_it_fits.strip()},
+            ensure_ascii=False,
+        )
+
+    @function_tool
     def add_emergency_clue(
         id: str,
         name: str,
@@ -464,18 +533,18 @@ def create_designer_tools(state: GameState) -> list[Any]:
         state.emergency_clue_added_this_request = True
         return json.dumps(clue, ensure_ascii=False)
 
-    return [save_case_file, read_case_file, add_case_detail, add_emergency_clue]
+    return [save_case_file, read_case_file, add_case_detail, add_character_knowledge, add_emergency_clue]
 
 
 def create_narrator_tools(state: GameState) -> list[Any]:
     @function_tool
     def look_up_case(section: str) -> str:
-        """Look up spoiler-safe case information: overview, player_role, characters, clues, mysteries, or opening."""
+        """Look up case information for internal continuity, including the timeline; do not expose private timeline knowledge as dialogue."""
         if state.case_file is None:
             return "The case is not ready yet."
-        if section in {"private_solution", "timeline", "consistency_check"}:
+        if section in {"private_solution", "consistency_check"}:
             return "That section is restricted. Use public character information and discoverable clues; resolve mysteries through the gated tool."
-        allowed = {"overview", "player_role", "characters", "clues", "mysteries", "opening"}
+        allowed = {"overview", "player_role", "timeline", "characters", "clues", "mysteries", "opening"}
         if section not in allowed:
             return "Unknown section. Available sections: " + ", ".join(sorted(allowed))
 
@@ -486,6 +555,7 @@ def create_narrator_tools(state: GameState) -> list[Any]:
             public_fields = {
                 "name", "importance", "is_suspect", "description", "relationships",
                 "apparent_opportunity", "public_alibi", "voice", "response_to_pressure",
+                "theory_or_lead", "clues_knowledge", "mystery_knowledge",
             }
             result: Any = [
                 {
@@ -525,6 +595,7 @@ def create_narrator_tools(state: GameState) -> list[Any]:
                 public_fields = {
                     "name", "importance", "is_suspect", "description", "relationships",
                     "apparent_opportunity", "public_alibi", "voice", "response_to_pressure",
+                    "theory_or_lead", "clues_knowledge", "mystery_knowledge",
                 }
                 return json.dumps(
                     {
@@ -558,7 +629,7 @@ def create_narrator_tools(state: GameState) -> list[Any]:
     def reveal_guarded_information(
         character_name: str, information_id: str, disclosure_sufficient: bool, justification: str
     ) -> str:
-        """Reveal a character's guarded information only after a relevant player action and knowledge."""
+        """Reveal guarded information when earned; on failure, return the Narrator's reason without the secret."""
         if state.case_file is None:
             return "The case is not ready yet."
         character = next(
@@ -577,7 +648,14 @@ def create_narrator_tools(state: GameState) -> list[Any]:
         if item is None:
             return "No guarded information with that ID exists for this character."
         if not disclosure_sufficient or len(justification.strip()) < 12:
-            return "The player's action and known information do not yet justify disclosure. No secret content was returned."
+            return json.dumps(
+                {
+                    "disclosed": False,
+                    "failure_reason": justification.strip() or "The player's action and known information do not yet justify disclosure.",
+                    "secret_withheld": True,
+                },
+                ensure_ascii=False,
+            )
         state.staged_character_information[key] = str(item["content"])
         return json.dumps({"character": character["name"], "information": item["content"]}, ensure_ascii=False)
 
@@ -609,7 +687,7 @@ def create_narrator_tools(state: GameState) -> list[Any]:
 
     @function_tool
     def resolve_mystery(mystery_id: str, resolution_sufficient: bool, reasoning: str) -> str:
-        """Resolve a mystery after the Narrator assesses the player's argument and knowledge."""
+        """Resolve a mystery after the Narrator's assessment; on failure, return its reason without the answer."""
         if state.case_file is None:
             return "The case is not ready yet."
         return state.stage_mystery_resolution(mystery_id, resolution_sufficient, reasoning)
@@ -623,20 +701,23 @@ def make_agents(state: GameState) -> tuple[Agent, Agent]:
 ## Application tool protocol
 The case is stored only through your tools, in application memory. You must call save_case_file with a valid JSON object before play begins. If validation rejects the draft, correct the reported problem and call save_case_file again; do not stop after the first rejection. Its required top-level keys are:
 overview, player_role, private_solution, timeline, characters, clues, mysteries, opening, consistency_check.
-Follow the detailed JSON schema and quality constraints in these instructions. Aim for at least four major characters and three initially plausible suspects, while meeting the minimum of three major characters and two suspects. Give every wrong suspect an exoneration mystery; give every major character an investigative hook; add a discovery_requirement to every clue and no clue prerequisites; mark every suspect's motive as guarded_information; make at least three auxiliary mysteries with resolution_requirements; and gate the scale-5 murder behind only one or two necessary auxiliary mysteries, with no required clue IDs. Once those mysteries are resolved, the Narrator should be able to resolve the murder after a compelling case. The app validates these requirements and will reject an incomplete case. The private_solution and timeline must contain enough detail to keep the mystery coherent.
+Follow the detailed JSON schema and quality constraints in these instructions. Aim for at least four major characters and three initially plausible suspects, while meeting the minimum of three major characters and two suspects. Give every wrong suspect an exoneration mystery; give every major character an investigative hook and at least one clue or mystery knowledge lead; add a discovery_requirement to every clue and no clue prerequisites; mark every suspect's motive as guarded_information; make at least three auxiliary mysteries with resolution_requirements; and gate the scale-5 murder behind only one or two necessary auxiliary mysteries, with no required clue IDs. Once those mysteries are resolved, the Narrator should be able to resolve the murder after a compelling case. The app validates these requirements and will reject an incomplete case. The private_solution and timeline must contain enough detail to keep the mystery coherent.
 Call read_case_file to check or reference the case. After play starts, never call save_case_file. Use add_case_detail only for a small compatible, non-decisive detail in a deliberate gap. Use add_emergency_clue only when the Narrator explicitly requests one through the stuck-player safeguard. Inspect the full canonical case, check every established fact and timeline constraint, and add exactly one fair, discoverable clue that addresses a specified unresolved mystery without changing the solution or retconning events. Do not turn it into a hard clue prerequisite or directly state a mystery answer. The application returns only the clue you added.
 """
     narrator_instructions = read_agent_prompt("narrator.md") + """
 
 ## Application tool protocol
-Use look_up_case and inspect_character only as internal references; their clue/mystery indexes and guarded-information criteria are not player-facing. Compare the player's actual action and prior knowledge with a clue's discovery_requirement, then call discover_clue with your honest action_sufficient boolean and concise justification. Ordinary clues have no hard evidence prerequisites. For character secrets, use reveal_guarded_information and decide disclosure_sufficient from the player's actual action and known information. Never mention an undiscovered clue, mystery, secret, trigger, or motive in dialogue or suggested actions. Suspect motives are always guarded and must only be described after their guarded information is returned. A broad room sweep reveals only ordinary visible details.
+Use look_up_case and inspect_character only as internal references; their clue/mystery indexes and guarded-information criteria are not player-facing. Character `theory_or_lead` is an ungated, public character perspective that may be voiced when relevant; use it to offer a fair nudge without turning it into proof. Compare the player's actual action and prior knowledge with a clue's discovery_requirement, then call discover_clue with your honest action_sufficient boolean and concise justification. Ordinary clues have no hard evidence prerequisites. For character secrets, use reveal_guarded_information and decide disclosure_sufficient from the player's actual action and known information. Never state an undiscovered clue's name, observation, or telltale feature. A character may mention an unresolved mystery's existence or broad question when it fits what they know, but prefer a nudge that lets the player discover the issue. Suspect motives are always guarded and must only be described after their guarded information is returned. A broad room sweep reveals only ordinary visible details.
+The timeline is available as a private continuity reference. Use it to keep events, alibis, and time references consistent, but do not reveal an entry merely because it appears there. In narration and dialogue, state an exact time only when the player has learned it from an established fact, discovered clue, or a character who could know it. A character may know when they themselves moved or what they personally observed (for example, a character who left at 8:32 may report that movement if asked), but they do not know the time or details of the murder unless they witnessed it or committed it. Do not let a character state another person's private movements as fact without a plausible source. The culprit's knowledge of the murder remains concealed until the murder is resolved; do not use private timeline knowledge to hint at it.
+Character `clues_knowledge` and `mystery_knowledge` are interview leads, not discovered evidence or mystery answers. Use them to make relevant characters feel informed and to offer a fair, appropriately vague lead when the player asks a related question or conversation naturally reaches it. Present each as that character's own observation, suspicion, or hearsay, with uncertainty matching its description. Do not volunteer unrelated leads, expose linked IDs, quote the internal description as an authoritative fact, describe an undiscovered clue as if found, or treat a lead as proof. Do not name an undiscovered clue or its telltale feature, but you may point toward a general place or line of inquiry (for example, suggest a closer look at the entrance or the ground nearby without mentioning footprints). The clue itself remains available only through `discover_clue` when its discovery requirement is met. A character may mention an unresolved mystery's existence or question, but must not explain or resolve it. Keep a culprit's incriminating knowledge concealed until the murder is resolved.
 For any concealed mystery, call resolve_mystery with the mystery ID, your honest resolution_sufficient boolean, and a concise reasoning note based on their argument and the application memory of what they know. Auxiliary mysteries have no hard prerequisites. Python enforces only the murder's selected auxiliary-mystery prerequisites; no clues are required by ID. Never disclose a mystery answer if its tool call does not resolve it.
+When resolve_mystery or reveal_guarded_information returns a failure_reason, use that reason in a brief in-world reaction: name the actual weakness in the player's argument or a relevant known alibi/defense, while keeping the guarded answer and internal clue IDs private. Do not invent evidence or merely say there is not enough proof; usually one or two sentences is enough.
 Whenever you reveal another durable objective fact, call record_player_fact before finishing your response. Do not record atmosphere, speculation, or an unverified character claim as truth. Use consult_case_designer only for a genuinely open gap: pass the exact current player action, one narrow question, and all relevant mystery IDs. For a genuinely stuck player or an authored mystery with no fair discovery route, you may use request_emergency_clue sparingly. It is a safety net after ordinary hints and investigation have failed, not a shortcut: target only the unresolved mystery that is blocked, then gently point the player toward the new clue without revealing its observation until they discover it.
 At the start of a turn, the application includes a compact memory of the premise, player role, discovered clues, resolved mysteries, guarded character information disclosed to the player, established facts, and the eight most recent exchanges. Treat that memory as authoritative. The application retains discoveries in memory after older dialogue is dropped from the prompt.
 """
     designer = Agent(
         name="Case Designer",
-        model="gpt-5.6-terra",
+        model="gpt-6.0-sol",
         instructions=designer_instructions,
         tools=create_designer_tools(state),
     )
@@ -695,14 +776,84 @@ At the start of a turn, the application includes a compact memory of the premise
         return json.dumps([item["detail"] for item in additions], ensure_ascii=False)
 
     @function_tool
+    async def request_character_knowledge_hint(
+        character_name: str,
+        knowledge_type: str,
+        clue_id: str,
+        mystery_id: str,
+        proposed_description: str,
+        hint_reason: str,
+    ) -> str:
+        """Ask the Case Designer to review and, if compatible, add one character lead during a player hint."""
+        if not state.game_started or state.case_file is None:
+            return "Character knowledge hints are available only during play."
+        if not all(value.strip() for value in (character_name, knowledge_type, clue_id, mystery_id, proposed_description, hint_reason)):
+            return "Request needs a character, knowledge type, clue ID, mystery ID, proposed lead, and hint reason."
+        if knowledge_type not in {"clue", "mystery"}:
+            return "knowledge_type must be 'clue' or 'mystery'."
+        character = next((c for c in state.case_file["characters"] if str(c["name"]).casefold() == character_name.casefold()), None)
+        clue = next((c for c in state.case_file["clues"] if str(c["id"]).casefold() == clue_id.casefold()), None)
+        mystery = next((m for m in state.case_file["mysteries"] if str(m["id"]).casefold() == mystery_id.casefold()), None)
+        if character is None or clue is None or mystery is None:
+            return "Request denied: the character, clue, and mystery must exist in the case."
+        if mystery_id.casefold() not in {str(value).casefold() for value in clue.get("mystery_ids", [])}:
+            return "Request denied: that clue is not linked to the requested mystery."
+        if mystery_id.casefold() in {key.casefold() for key in state.resolved_mysteries}:
+            return "Request denied: use existing knowledge for an already resolved mystery."
+
+        field_name = "clues_knowledge" if knowledge_type == "clue" else "mystery_knowledge"
+        if any(
+            str(entry.get("clue_id", "")).casefold() == clue_id.casefold()
+            and str(entry.get("mystery_id", "")).casefold() == mystery_id.casefold()
+            for entry in character.get(field_name, [])
+        ):
+            return "Request denied: this character already has a lead linked to that clue and mystery."
+
+        state.character_knowledge_request_active = True
+        state.character_knowledge_added_this_request = False
+        state.character_knowledge_request_target = (
+            character["name"].casefold(), knowledge_type, clue["id"].casefold(), mystery["id"].casefold()
+        )
+        try:
+            await Runner.run(
+                designer,
+                input=(
+                    "The Narrator is trying to give a fair, spoiler-free hint because the player appears stuck. "
+                    "Read the full canonical case. Assess whether adding this one character knowledge lead is "
+                    "plausible for the character, consistent with the timeline and established facts, and useful "
+                    "without revealing a clue observation, proving a theory, resolving a mystery, exposing the culprit, "
+                    "or creating a contradiction. You may use add_character_knowledge only if all checks pass; otherwise "
+                    "add nothing. Do not alter or replace the case file. The application will return only an accepted lead.\n\n"
+                    f"PLAYER ACTION (exact): {state.current_player_action}\n"
+                    f"CHARACTER: {character['name']}\nKNOWLEDGE TYPE: {knowledge_type}\n"
+                    f"LINKED CLUE ID: {clue['id']}\nLINKED MYSTERY ID: {mystery['id']}\n"
+                    f"PROPOSED VAGUE LEAD: {proposed_description}\n"
+                    f"WHY THIS HINT IS NEEDED: {hint_reason}\n"
+                    f"ALREADY RESOLVED MYSTERIES: {json.dumps(list(state.resolved_mysteries), ensure_ascii=False)}"
+                ),
+                max_turns=5,
+            )
+        except Exception:
+            return "The Case Designer could not review a character lead. Offer an ordinary spoiler-free nudge instead."
+        finally:
+            state.character_knowledge_request_active = False
+            state.character_knowledge_request_target = None
+
+        if not state.character_knowledge_added_this_request:
+            return "The Case Designer did not approve a new lead. Offer an ordinary spoiler-free nudge instead."
+        entry = character[field_name][-1]
+        return json.dumps(
+            {"character": character["name"], "knowledge_type": knowledge_type, "description": entry["description"]},
+            ensure_ascii=False,
+        )
+
+    @function_tool
     async def request_emergency_clue(stuck_reason: str, relevant_mystery_ids: list[str]) -> str:
         """Rarely request one new clue when ordinary investigation cannot fairly advance an unresolved mystery."""
         if DEBUG_MODE:
             print("adding emergency clue")
         if not state.game_started or state.case_file is None:
             return "Emergency clue requests are available only during play."
-        if len(state.recent_turns) < 4:
-            return "Continue ordinary investigation and offer hints before requesting a safety-net clue."
         if not stuck_reason.strip():
             return "Describe the specific unfair or blocked mystery path."
 
@@ -729,7 +880,6 @@ At the start of a turn, the application includes a compact memory of the premise
             return "Resolve the murder's existing auxiliary-mystery prerequisites first; do not add a clue to bypass them."
 
         previous_clue_ids = {str(clue["id"]).casefold() for clue in state.case_file["clues"]}
-        state.emergency_clue_requests += 1
         state.emergency_clue_request_active = True
         state.emergency_clue_added_this_request = False
         state.emergency_clue_target_mysteries = {value.casefold() for value in target_ids}
@@ -763,16 +913,13 @@ At the start of a turn, the application includes a compact memory of the premise
         if not added:
             return "No emergency clue was added. Continue with fair hints and established evidence."
         state.emergency_clue_added_this_request = False
-        state.emergency_clue_mysteries.update(
-            str(value).casefold() for value in added[0].get("mystery_ids", [])
-        )
         return json.dumps(added[0], ensure_ascii=False)
 
     narrator = Agent(
         name="Narrator",
-        model="gpt-5.6-luna",
+        model="gpt-6.0-luna",
         instructions=narrator_instructions,
-        tools=[*create_narrator_tools(state), consult_case_designer, request_emergency_clue],
+        tools=[*create_narrator_tools(state), consult_case_designer, request_character_knowledge_hint, request_emergency_clue],
     )
     return designer, narrator
 
